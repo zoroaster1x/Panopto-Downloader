@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Panopto Video Downloader
 // @namespace    http://tampermonkey.net/
-// @version      3.1.0
+// @version      3.2.1
 // @description  Download the combined, camera or slides stream (HLS resolved to MP4), resize the viewer, hide a stream, and keep both players in sync.
 // @author       Zoroaster1x
 // @license      GPL-3.0
@@ -1799,11 +1799,17 @@
 
             const secondaryWrapper = rightPlayers.querySelector('.secondaryPlayer');
             const secondaryContent = secondaryWrapper ? secondaryWrapper.querySelector('.secondary-content') : null;
+            // A slides-only / camera-only recording has a single player and no
+            // secondary wrapper. Panopto's native layout already puts it in the
+            // right pane; the two-stream split must not touch it.
+            // The wrapper can exist as an empty placeholder; the video is the
+            // definitive signal for a real second stream.
+            const singleStream = !document.getElementById('secondaryVideo');
             return {
                 viewer, leftPane, leftPlayer, primaryPlayer, primaryScreen, aside,
                 eventTabs, eventTabPanes, eventTabControl, searchRegion,
                 main, rightPane, rightPlayers, secondaryScreen, playControls, thumbs,
-                secondaryWrapper, secondaryContent,
+                secondaryWrapper, secondaryContent, singleStream,
                 roaming: document.querySelector('.secondaryPlayer.player.roaming')
             };
         }
@@ -1887,6 +1893,27 @@
             if (window.__PDL_HARNESS__) window.__PDL_APPLY_COUNT__ = (window.__PDL_APPLY_COUNT__ || 0) + 1;
             parts = parts || findParts();
             if (!parts) return false;
+
+            // Panopto may create the second player after the first findParts().
+            // Refresh when the single/multi verdict no longer matches the DOM.
+            const hasSecond = !!document.getElementById('secondaryVideo');
+            if (parts.singleStream === hasSecond) {
+                parts = findParts();
+                if (!parts) return false;
+            }
+
+            if (parts.singleStream) {
+                // One player: resizing it as the camera covers the sidebar with
+                // the player's black background. Keep Panopto's own layout.
+                if (origStyles) restore();
+                parts.viewer.classList.remove('pdl-managed');
+                document.body.classList.remove('pdl-managed', 'pdl-no-camera', 'pdl-no-slides', 'pdl-left-collapsed');
+                if (handle) handle.style.display = 'none';
+                scheduleHandle();
+                return false;
+            }
+            if (handle) handle.style.display = '';
+
             if (!origStyles) snapshot();
 
             applying = true;
@@ -2116,6 +2143,7 @@
             if (!handle) return;
             if (!parts) parts = findParts();
             if (!parts) { handle.className = ''; handle.style.display = 'none'; return; }
+            if (parts.singleStream) { handle.className = ''; handle.style.display = 'none'; return; }
 
             if (state.collapsed) {
                 const vr = parts.viewer.getBoundingClientRect();
@@ -2364,9 +2392,10 @@
                 parts = findParts();
                 if (!parts) return false;
                 snapshot();
+                if (handle) handle.style.display = parts.singleStream ? 'none' : '';
                 startObserver();
                 watchPaneWidths();
-                if (typeof state.ratio === 'number' || !state.camera || !state.slides || state.collapsed) {
+                if (!parts.singleStream && (typeof state.ratio === 'number' || !state.camera || !state.slides || state.collapsed)) {
                     apply();
                 }
                 scheduleHandle();
@@ -2383,8 +2412,14 @@
             window.addEventListener('popstate', () => setTimeout(() => { parts = null; origStyles = null; attach(); }, 400));
         }
 
+        function isSingleStream() {
+            parts = parts || findParts();
+            return !!(parts && parts.singleStream);
+        }
+
         return {
             init, apply, reset, setRatio, setCamera, setSlides, setCollapsed,
+            isSingleStream,
             currentRatio,
             getState: () => Object.assign({}, state),
             set onChange(fn) { onChange = fn; }
@@ -3870,41 +3905,48 @@
                 return;
             }
 
-            view.appendChild(h('div', { class: 'pdl-layout-intro', html:
-                'Drag the divider between the sidebar and the slides. Double-click it to reset. ' +
-                'Use <kbd>←</kbd> / <kbd>→</kbd> when it is focused for fine steps.'
-            }));
+            const single = Layout.isSingleStream();
+            if (single) {
+                view.appendChild(h('div', { class: 'pdl-layout-intro', html:
+                    'This recording has a single video stream, so Panopto\'s own layout is kept. ' +
+                    'The divider and the camera/slides toggles are disabled here.'
+                }));
+            } else {
+                view.appendChild(h('div', { class: 'pdl-layout-intro', html:
+                    'Drag the divider between the sidebar and the slides. Double-click it to reset. ' +
+                    'Use <kbd>←</kbd> / <kbd>→</kbd> when it is focused for fine steps.'
+                }));
 
-            const ratio = Layout.currentRatio();
-            const range = h('input', {
-                class: 'pdl-range',
-                type: 'range',
-                min: '16',
-                max: '72',
-                step: '1',
-                value: String(Math.round(ratio * 100)),
-                'aria-label': 'Sidebar width'
-            });
-            const rangeVal = h('span', { class: 'pdl-range-val', text: state.slides ? Math.round(ratio * 100) + '%' : 'Full' });
-            if (!state.slides) range.disabled = true;
-            range.addEventListener('input', () => {
-                const v = Number(range.value) / 100;
-                rangeVal.textContent = range.value + '%';
-                Layout.setRatio(v);
-            });
+                const ratio = Layout.currentRatio();
+                const range = h('input', {
+                    class: 'pdl-range',
+                    type: 'range',
+                    min: '16',
+                    max: '72',
+                    step: '1',
+                    value: String(Math.round(ratio * 100)),
+                    'aria-label': 'Sidebar width'
+                });
+                const rangeVal = h('span', { class: 'pdl-range-val', text: state.slides ? Math.round(ratio * 100) + '%' : 'Full' });
+                if (!state.slides) range.disabled = true;
+                range.addEventListener('input', () => {
+                    const v = Number(range.value) / 100;
+                    rangeVal.textContent = range.value + '%';
+                    Layout.setRatio(v);
+                });
 
-            view.appendChild(h('div', { class: 'pdl-row' }, [
-                h('div', { class: 'pdl-row-label' }, [
-                    h('strong', { text: 'Sidebar width' }),
-                    h('span', { text: 'Camera and tabs vs slides' })
-                ]),
-                h('div', { class: 'pdl-split-control', style: 'width:190px' }, [range, rangeVal])
-            ]));
+                view.appendChild(h('div', { class: 'pdl-row' }, [
+                    h('div', { class: 'pdl-row-label' }, [
+                        h('strong', { text: 'Sidebar width' }),
+                        h('span', { text: 'Camera and tabs vs slides' })
+                    ]),
+                    h('div', { class: 'pdl-split-control', style: 'width:190px' }, [range, rangeVal])
+                ]));
 
-            view.appendChild(toggleRow('Camera stream', 'Show the presenter camera', state.camera, (on) => Layout.setCamera(on)));
-            view.appendChild(toggleRow('Slides stream', 'Show the screen / slide capture', state.slides, (on) => Layout.setSlides(on)));
-            view.appendChild(toggleRow('Focus slides', 'Hide the sidebar column (camera audio keeps playing)', state.collapsed, (on) => Layout.setCollapsed(on)));
-
+                view.appendChild(toggleRow('Camera stream', 'Show the presenter camera', state.camera, (on) => Layout.setCamera(on)));
+                view.appendChild(toggleRow('Slides stream', 'Show the screen / slide capture', state.slides, (on) => Layout.setSlides(on)));
+                view.appendChild(toggleRow('Focus slides', 'Hide the sidebar column (camera audio keeps playing)', state.collapsed, (on) => Layout.setCollapsed(on)));
+            }
             view.appendChild(h('div', { class: 'pdl-row' }, [
                 h('div', { class: 'pdl-row-label' }, [
                     h('strong', { text: 'Reset layout' }),
@@ -3916,10 +3958,10 @@
             view.appendChild(h('div', { class: 'pdl-section-title', style: 'margin-top:16px', text: 'Playback' }));
             view.appendChild(h('div', { class: 'pdl-row' }, [
                 h('div', { class: 'pdl-row-label' }, [
-                    h('strong', { text: 'Resume both streams' }),
+                    h('strong', { text: single ? 'Resume playback' : 'Resume both streams' }),
                     h('span', { text: 'Fixes the pause / no-audio bug' })
                 ]),
-                h('button', { class: 'pdl-text-btn', type: 'button', onclick: () => { Player.playAll(); toast('Both streams resumed', 'success'); } }, [h('span', { html: icon('play', 12) }), h('span', { text: 'Play' })])
+                h('button', { class: 'pdl-text-btn', type: 'button', onclick: () => { Player.playAll(); toast(single ? 'Playback resumed' : 'Both streams resumed', 'success'); } }, [h('span', { html: icon('play', 12) }), h('span', { text: 'Play' })])
             ]));
 
             view.appendChild(h('div', { class: 'pdl-section-title', style: 'margin-top:16px', text: 'Looks' }));
@@ -4000,16 +4042,32 @@
        writes (scrollTop/scrollLeft/scrollTo/scrollIntoView) for a few seconds.
        ============================================================ */
 
-    function initScrollGuard() {
-        if (!IS_TOP) return;
-        const manual = new WeakMap();
-        const WINDOW_MS = 6000;
-        const mark = (el) => { if (el) manual.set(el, Date.now() + WINDOW_MS); };
-        const isManual = (el) => (manual.get(el) || 0) > Date.now();
-        const proto = (() => { try { return PAGE_WINDOW.Element.prototype; } catch (e) { return Element.prototype; } })();
+    /* ============================================================
+       SCROLL GUARD
 
-        if (proto && !proto.__pdlScrollProtoHooked) {
-            proto.__pdlScrollProtoHooked = true;
+       Panopto's jQuery "scrollingHighlight" animates the thumbnail strip and
+       the Contents pane to follow the playhead, one write per frame. A
+       userscript manager that runs scripts in a sandbox (Violentmonkey and
+       Tampermonkey on Firefox) wraps page objects in Xray wrappers: an
+       accessor defined from the sandbox is invisible to the page's own
+       jQuery, so it must be defined in the page context. The guard below is
+       injected as a page script; the sandbox version is only a fallback for
+       pages whose CSP blocks injection.
+
+       While the user is scrolling, programmatic scroll writes are dropped
+       for good. A click hands control back to Panopto, so clicking a
+       thumbnail or a chapter lets it follow again.
+       ============================================================ */
+
+    function pageScrollGuard() {
+        if (window.__pdlScrollGuardInstalled) return;
+        window.__pdlScrollGuardInstalled = true;
+
+        const pinned = new WeakSet();
+        const proto = Element.prototype;
+
+        if (!proto.__pdlScrollProtoPatched) {
+            proto.__pdlScrollProtoPatched = true;
             const wrap = (name) => {
                 const original = proto[name];
                 if (typeof original !== 'function') return;
@@ -4017,10 +4075,10 @@
                     if (name === 'scrollIntoView') {
                         let node = this;
                         while (node) {
-                            if (isManual(node)) return;
+                            if (pinned.has(node)) return;
                             node = node.parentElement;
                         }
-                    } else if (isManual(this)) {
+                    } else if (pinned.has(this)) {
                         return;
                     }
                     return original.apply(this, arguments);
@@ -4035,42 +4093,29 @@
         const install = (el) => {
             if (!el || guarded.has(el)) return;
             guarded.add(el);
-            if (window.__PDL_HARNESS__) window.__PDL_INSTALL_COUNT__ = (window.__PDL_INSTALL_COUNT__ || 0) + 1;
-
-            // Panopto animates scrollLeft/scrollTop with jQuery (scrollingHighlight),
-            // one write per frame. Reverting after the fact loses that race, so
-            // drop the writes while the user is the one scrolling.
-            const guardProp = (prop) => {
-                let desc = null;
-                try { desc = Object.getOwnPropertyDescriptor(proto, prop); } catch (e) { /* ignore */ }
+            ['scrollLeft', 'scrollTop'].forEach(prop => {
+                const desc = Object.getOwnPropertyDescriptor(proto, prop);
                 if (!desc || !desc.get || !desc.set) return;
                 try {
                     Object.defineProperty(el, prop, {
                         configurable: true,
                         get() { return desc.get.call(this); },
                         set(value) {
-                            if (isManual(el)) return;
+                            if (pinned.has(el)) return;
                             desc.set.call(this, value);
                         }
                     });
-                } catch (e) {
-                    if (window.__PDL_HARNESS__) window.__PDL_GUARD_ERR__ = prop + ': ' + String(e);
-                }
-            };
-            guardProp('scrollLeft');
-            guardProp('scrollTop');
-
-            let userUntil = 0;
-            const userScroll = () => {
-                userUntil = Date.now() + 350;
-                mark(el);
-                if (window.__PDL_HARNESS__) window.__PDL_WHEEL_MARKS__ = (window.__PDL_WHEEL_MARKS__ || 0) + 1;
-            };
-            el.__pdlUserScroll = userScroll;
-            el.addEventListener('wheel', userScroll, { passive: true, capture: true });
-            el.addEventListener('pointerdown', () => { userUntil = Date.now() + 500; mark(el); }, { passive: true, capture: true });
-            el.addEventListener('touchstart', () => { userUntil = Date.now() + 500; mark(el); }, { passive: true, capture: true });
-            el.addEventListener('keydown', () => userScroll(), { passive: true, capture: true });
+                } catch (e) { /* ignore */ }
+            });
+            // Any real user scroll stops the playhead follow until a click
+            // says "take me there". No timer: the position must not snap back.
+            el.addEventListener('wheel', () => pinned.add(el), { passive: true, capture: true });
+            el.addEventListener('touchmove', () => pinned.add(el), { passive: true, capture: true });
+            el.addEventListener('keydown', () => pinned.add(el), { passive: true, capture: true });
+            el.addEventListener('pointerdown', (e) => {
+                if (e.target === el) pinned.add(el); // scrollbar or empty strip
+            }, { passive: true, capture: true });
+            el.addEventListener('click', () => pinned.delete(el), { passive: true, capture: true });
         };
 
         const scan = () => {
@@ -4079,38 +4124,168 @@
             document.querySelectorAll('.event-tab-scroll-pane').forEach(install);
         };
         scan();
+        setTimeout(scan, 800);
+        setTimeout(scan, 2500);
 
-        const markFromEvent = (e) => {
-            if (window.__PDL_HARNESS__) window.__PDL_SCROLL_EVENTS__ = (window.__PDL_SCROLL_EVENTS__ || 0) + 1;
-            const target = e.target && e.target.closest ? e.target.closest('#thumbnailList, .event-tab-scroll-pane') : null;
-            if (target && target.__pdlUserScroll) target.__pdlUserScroll();
+        let scheduled = false;
+        const scanSoon = () => {
+            if (scheduled) return;
+            scheduled = true;
+            setTimeout(() => { scheduled = false; scan(); }, 250);
         };
-        document.addEventListener('wheel', markFromEvent, { passive: true, capture: true });
-        document.addEventListener('pointerdown', markFromEvent, { passive: true, capture: true });
+        try {
+            new MutationObserver(scanSoon).observe(document.documentElement || document, { childList: true, subtree: true });
+        } catch (e) { /* ignore */ }
 
         if (window.__PDL_HARNESS__) {
             window.__PDL_SCROLL_DEBUG__ = () => {
                 const t = document.getElementById('thumbnailList');
                 return {
-                    installed: !!(t && guarded.has(t)),
-                    hasUserScroll: !!(t && typeof t.__pdlUserScroll === 'function'),
-                    installs: window.__PDL_INSTALL_COUNT__ || 0,
-                    events: window.__PDL_SCROLL_EVENTS__ || 0,
-                    marks: window.__PDL_WHEEL_MARKS__ || 0,
+                    installed: true,
+                    page: true,
+                    guarded: !!(t && guarded.has(t)),
                     desc: !!(t && Object.getOwnPropertyDescriptor(t, 'scrollLeft')),
-                    guardErr: window.__PDL_GUARD_ERR__ || null,
-                    proto: !!proto.__pdlScrollProtoHooked,
-                    manual: t ? isManual(t) : null,
-                    siv: proto.scrollIntoView.toString().slice(0, 90)
+                    pinned: !!(t && pinned.has(t))
                 };
             };
         }
+    }
 
-        let timer = 0;
-        new MutationObserver(() => {
-            clearTimeout(timer);
-            timer = setTimeout(scan, 400);
-        }).observe(document.body, { childList: true, subtree: true });
+    function sandboxScrollGuard() {
+            if (!IS_TOP) return;
+            const manual = new WeakMap();
+            const WINDOW_MS = 6000;
+            const mark = (el) => { if (el) manual.set(el, Date.now() + WINDOW_MS); };
+            const isManual = (el) => (manual.get(el) || 0) > Date.now();
+            const proto = (() => { try { return PAGE_WINDOW.Element.prototype; } catch (e) { return Element.prototype; } })();
+
+            if (proto && !proto.__pdlScrollProtoHooked) {
+                proto.__pdlScrollProtoHooked = true;
+                const wrap = (name) => {
+                    const original = proto[name];
+                    if (typeof original !== 'function') return;
+                    proto[name] = function () {
+                        if (name === 'scrollIntoView') {
+                            let node = this;
+                            while (node) {
+                                if (isManual(node)) return;
+                                node = node.parentElement;
+                            }
+                        } else if (isManual(this)) {
+                            return;
+                        }
+                        return original.apply(this, arguments);
+                    };
+                };
+                wrap('scrollIntoView');
+                wrap('scrollTo');
+                wrap('scrollBy');
+            }
+
+            const guarded = new WeakSet();
+            const install = (el) => {
+                if (!el || guarded.has(el)) return;
+                guarded.add(el);
+                if (window.__PDL_HARNESS__) window.__PDL_INSTALL_COUNT__ = (window.__PDL_INSTALL_COUNT__ || 0) + 1;
+
+                // Panopto animates scrollLeft/scrollTop with jQuery (scrollingHighlight),
+                // one write per frame. Reverting after the fact loses that race, so
+                // drop the writes while the user is the one scrolling.
+                const guardProp = (prop) => {
+                    let desc = null;
+                    try { desc = Object.getOwnPropertyDescriptor(proto, prop); } catch (e) { /* ignore */ }
+                    if (!desc || !desc.get || !desc.set) return;
+                    try {
+                        Object.defineProperty(el, prop, {
+                            configurable: true,
+                            get() { return desc.get.call(this); },
+                            set(value) {
+                                if (isManual(el)) return;
+                                desc.set.call(this, value);
+                            }
+                        });
+                    } catch (e) {
+                        if (window.__PDL_HARNESS__) window.__PDL_GUARD_ERR__ = prop + ': ' + String(e);
+                    }
+                };
+                guardProp('scrollLeft');
+                guardProp('scrollTop');
+
+                let userUntil = 0;
+                const userScroll = () => {
+                    userUntil = Date.now() + 350;
+                    mark(el);
+                    if (window.__PDL_HARNESS__) window.__PDL_WHEEL_MARKS__ = (window.__PDL_WHEEL_MARKS__ || 0) + 1;
+                };
+                el.__pdlUserScroll = userScroll;
+                el.addEventListener('wheel', userScroll, { passive: true, capture: true });
+                el.addEventListener('pointerdown', () => { userUntil = Date.now() + 500; mark(el); }, { passive: true, capture: true });
+                el.addEventListener('touchstart', () => { userUntil = Date.now() + 500; mark(el); }, { passive: true, capture: true });
+                el.addEventListener('keydown', () => userScroll(), { passive: true, capture: true });
+            };
+
+            const scan = () => {
+                const thumb = document.getElementById('thumbnailList');
+                if (thumb) install(thumb);
+                document.querySelectorAll('.event-tab-scroll-pane').forEach(install);
+            };
+            scan();
+
+            const markFromEvent = (e) => {
+                if (window.__PDL_HARNESS__) window.__PDL_SCROLL_EVENTS__ = (window.__PDL_SCROLL_EVENTS__ || 0) + 1;
+                const target = e.target && e.target.closest ? e.target.closest('#thumbnailList, .event-tab-scroll-pane') : null;
+                if (target && target.__pdlUserScroll) target.__pdlUserScroll();
+            };
+            document.addEventListener('wheel', markFromEvent, { passive: true, capture: true });
+            document.addEventListener('pointerdown', markFromEvent, { passive: true, capture: true });
+
+            if (window.__PDL_HARNESS__) {
+                window.__PDL_SCROLL_DEBUG__ = () => {
+                    const t = document.getElementById('thumbnailList');
+                    return {
+                        installed: !!(t && guarded.has(t)),
+                        hasUserScroll: !!(t && typeof t.__pdlUserScroll === 'function'),
+                        installs: window.__PDL_INSTALL_COUNT__ || 0,
+                        events: window.__PDL_SCROLL_EVENTS__ || 0,
+                        marks: window.__PDL_WHEEL_MARKS__ || 0,
+                        desc: !!(t && Object.getOwnPropertyDescriptor(t, 'scrollLeft')),
+                        guardErr: window.__PDL_GUARD_ERR__ || null,
+                        proto: !!proto.__pdlScrollProtoHooked,
+                        manual: t ? isManual(t) : null,
+                        siv: proto.scrollIntoView.toString().slice(0, 90)
+                    };
+                };
+            }
+
+            let timer = 0;
+            new MutationObserver(() => {
+                clearTimeout(timer);
+                timer = setTimeout(scan, 400);
+            }).observe(document.body, { childList: true, subtree: true });
+    
+    }
+
+    function injectPageScrollGuard() {
+        const source = '(' + pageScrollGuard.toString() + ')();';
+        const root = document.documentElement || document.head;
+        if (!root) { setTimeout(injectPageScrollGuard, 50); return; }
+        try {
+            const script = document.createElement('script');
+            script.textContent = source;
+            root.appendChild(script);
+            script.remove();
+        } catch (e) { /* CSP or XML page: fall back to the sandbox guard */ }
+    }
+
+    function initScrollGuard() {
+        if (!IS_TOP) return;
+        injectPageScrollGuard();
+        if (PAGE_WINDOW.__pdlScrollGuardInstalled) {
+            try { console.info('[Panopto DL] scroll guard: page-context'); } catch (e) { /* ignore */ }
+            return;
+        }
+        try { console.info('[Panopto DL] scroll guard: sandbox fallback'); } catch (e) { /* ignore */ }
+        sandboxScrollGuard();
     }
 
     function injectSidebarButton() {
