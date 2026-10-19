@@ -378,6 +378,24 @@
         body.pdl-dark #eventTabPanes .event-text span,
         body.pdl-dark #eventTabPanes .event-user { white-space: normal !important; overflow-wrap: anywhere; }
         body.pdl-dark #eventTabPanes .event-time { margin-left: auto; }
+        /* Active pane: header/textarea stay, the scroll area takes the rest. */
+        body.pdl-managed #eventTabPanes .event-tab-pane:not([style*="display: none"]):not([style*="display:none"]) {
+            display: flex !important;
+            flex-direction: column;
+        }
+        body.pdl-managed #eventTabPanes .event-tab-pane .event-tab-scroll-pane {
+            flex: 1 1 auto;
+            height: auto !important;
+            min-height: 0;
+        }
+        body.pdl-dark #eventTabPanes .event-tab-scroll-pane,
+        body.pdl-dark #eventTabPanes .event-tab-pane {
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255,255,255,.22) transparent;
+        }
+        body.pdl-dark #eventTabPanes ::-webkit-scrollbar { width: 8px; height: 8px; }
+        body.pdl-dark #eventTabPanes ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.22); border-radius: 4px; }
+        body.pdl-dark #eventTabPanes ::-webkit-scrollbar-track { background: transparent; }
         body.pdl-dark .event-tab-scroll-pane { background: transparent !important; }
         body.pdl-dark .event-tab-pane-header {
             background: linear-gradient(180deg, #1c1c24 0%, #16161d 100%) !important;
@@ -534,6 +552,33 @@
             background: linear-gradient(180deg, #1c1c24 0%, #16161d 100%) !important;
             border-bottom: 1px solid rgba(255,255,255,0.06) !important;
             color: #e6e6ec !important;
+            display: flex !important;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 6px 8px;
+            padding: 8px !important;
+        }
+        body.pdl-dark #notesPaneHeader #channelSelect {
+            flex: 1 1 calc(100% - 44px);
+            min-width: 0;
+            max-width: 100%;
+            font-size: 11px !important;
+        }
+        body.pdl-dark #notesPaneHeader #notesDownload { flex: none; margin-left: auto; }
+        body.pdl-dark #notesPaneHeader #togglePublic,
+        body.pdl-dark #notesPaneHeader .event-tab-help {
+            flex: none;
+            float: none !important;
+            font-size: 11px;
+        }
+        body.pdl-dark #notesPaneHeader .event-tab-help { margin-left: auto; }
+        body.pdl-dark #notesTabPane textarea.event-input {
+            width: calc(100% - 12px) !important;
+            min-height: 84px !important;
+            height: auto !important;
+            margin: 6px !important;
+            line-height: 1.5;
+            resize: vertical;
         }
         body.pdl-dark #channelSelect,
         body.pdl-dark #channelInput {
@@ -1716,6 +1761,11 @@
         let applying = false;
         let handle = null;
         let handleRaf = 0;
+        let lastGeometry = null;
+        let suppressUntil = 0;
+        let paneRO = null;
+        let paneMO = null;
+        let paneSyncRaf = 0;
         let aspectCache = new WeakMap();
         let onChange = null;
 
@@ -1815,7 +1865,26 @@
             screen.style.marginTop = Math.round(-sh / 2) + 'px';
         }
 
+        function geometrySnapshot() {
+            if (!parts) return null;
+            const r = (el) => el ? el.getBoundingClientRect() : null;
+            const l = r(parts.leftPane), v = r(parts.viewer), rp = r(parts.rightPlayers), et = r(parts.eventTabs), ep = r(parts.eventTabPanes);
+            return {
+                lw: l ? l.width : 0, lh: l ? l.height : 0,
+                vw: v ? v.width : 0, vh: v ? v.height : 0,
+                rw: rp ? rp.width : 0, rh: rp ? rp.height : 0,
+                tw: et ? et.width : 0, th: et ? et.height : 0,
+                pw: ep ? ep.width : 0
+            };
+        }
+
+        function geometryClose(a, b, tolerance) {
+            if (!a || !b) return false;
+            return Object.keys(a).every(k => Math.abs((a[k] || 0) - (b[k] || 0)) <= tolerance);
+        }
+
         function apply() {
+            if (window.__PDL_HARNESS__) window.__PDL_APPLY_COUNT__ = (window.__PDL_APPLY_COUNT__ || 0) + 1;
             parts = parts || findParts();
             if (!parts) return false;
             if (!origStyles) snapshot();
@@ -1836,6 +1905,7 @@
             // pane's content min-width pins the left column and it cannot grow.
             const managed = typeof state.ratio === 'number' || !state.camera || !state.slides || state.collapsed;
             p.viewer.classList.toggle('pdl-managed', managed);
+            document.body.classList.toggle('pdl-managed', managed);
 
             if (state.collapsed) {
                 p.leftPane.style.display = 'none';
@@ -1898,6 +1968,14 @@
                     p.eventTabs.style.height = tabsH + 'px';
                     p.eventTabs.style.minHeight = '0';
                 }
+                if (p.aside) {
+                    // The aside must shrink when the camera grows, otherwise its
+                    // stale height pushes the tab content under the player and
+                    // the bottom items become unreachable.
+                    p.aside.style.height = Math.max(0, H - camH) + 'px';
+                    p.aside.style.minHeight = '0';
+                    p.aside.style.overflow = 'hidden';
+                }
                 if (p.eventTabPanes) {
                     const panesW = Math.max(60, Math.round((p.leftPane.getBoundingClientRect().width || targetW) - tabControlW));
                     p.eventTabPanes.style.width = panesW + 'px';
@@ -1932,6 +2010,7 @@
                 }
             }
 
+            lastGeometry = geometrySnapshot();
             // Drop the style mutations we just caused so the observer doesn't loop.
             if (observer) observer.takeRecords();
             applying = false;
@@ -1939,6 +2018,62 @@
             scheduleHandle();
             if (onChange) onChange();
             return true;
+        }
+
+        function syncPaneWidths() {
+            if (!parts || !parts.eventTabPanes) return;
+            const lpW = parts.leftPane.getBoundingClientRect().width || 0;
+            if (lpW < 80) return;
+            const tabControlW = parts.eventTabControl ? Math.round(parts.eventTabControl.getBoundingClientRect().width) + 6 : 115;
+            const panesW = Math.max(60, Math.round(lpW - tabControlW));
+            const target = panesW + 'px';
+            let applied = false;
+            if (parts.eventTabPanes.style.width !== target) {
+                parts.eventTabPanes.style.width = target;
+                applied = true;
+            }
+            if (parts.eventTabPanes.style.overflow !== 'hidden') parts.eventTabPanes.style.overflow = 'hidden';
+            parts.eventTabPanes.querySelectorAll('.event-tab-pane').forEach(pane => {
+                if (pane.style.width !== target) {
+                    pane.style.width = target;
+                    applied = true;
+                }
+            });
+            if (window.__PDL_HARNESS__) {
+                window.__PDL_PANE_SYNC__ = { lpW: Math.round(lpW), tabControlW, panesW, applied };
+            }
+        }
+
+        // Panopto writes its own inline widths back when tabs switch, and the
+        // active pane then sits in a narrower box than the sidebar. Watch both
+        // columns and keep the pane container matched, without a full apply.
+        function schedulePaneSync() {
+            if (paneSyncRaf) return;
+            paneSyncRaf = requestAnimationFrame(() => {
+                paneSyncRaf = 0;
+                syncPaneWidths();
+            });
+        }
+
+        function watchPaneWidths() {
+            if (!parts || !parts.eventTabPanes) return;
+            try { if (paneRO) paneRO.disconnect(); } catch (e) { /* ignore */ }
+            try { if (paneMO) paneMO.disconnect(); } catch (e) { /* ignore */ }
+            paneRO = null;
+            paneMO = null;
+            if (window.ResizeObserver) {
+                paneRO = new ResizeObserver(schedulePaneSync);
+                try {
+                    paneRO.observe(parts.leftPane);
+                    paneRO.observe(parts.eventTabPanes);
+                    parts.eventTabPanes.querySelectorAll('.event-tab-pane').forEach(p => paneRO.observe(p));
+                } catch (e) { /* ignore */ }
+            }
+            paneMO = new MutationObserver(schedulePaneSync);
+            try {
+                paneMO.observe(parts.eventTabPanes, { childList: true, attributes: true, attributeFilter: ['style'] });
+                parts.eventTabPanes.querySelectorAll('.event-tab-pane').forEach(p => paneMO.observe(p, { attributes: true, attributeFilter: ['style'] }));
+            } catch (e) { /* ignore */ }
         }
 
         function scheduleApply(delay) {
@@ -1953,6 +2088,20 @@
             observer = new MutationObserver(() => {
                 if (applying) return;
                 if (typeof state.ratio !== 'number' && state.camera && state.slides && !state.collapsed) {
+                    scheduleHandle();
+                    return;
+                }
+                // Switching Panopto tabs is not a layout change. Re-applying
+                // here made the whole viewer flicker on every click.
+                if (Date.now() < suppressUntil) {
+                    scheduleHandle();
+                    return;
+                }
+                // Panopto toggles tabs by changing styles inside the pane. That
+                // is not a layout change; re-applying made the whole viewer
+                // flicker on every tab switch.
+                const g = geometrySnapshot();
+                if (lastGeometry && g && geometryClose(g, lastGeometry, 2)) {
                     scheduleHandle();
                     return;
                 }
@@ -2055,6 +2204,8 @@
             save();
             restore();
             if (parts && parts.viewer) parts.viewer.classList.remove('pdl-managed');
+            document.body.classList.remove('pdl-managed');
+            lastGeometry = null;
             origStyles = null;
             parts = null;
             try { window.dispatchEvent(new Event('resize')); } catch (e) { /* ignore */ }
@@ -2200,11 +2351,21 @@
         function init() {
             if (!IS_TOP) return;
             buildHandle();
+            document.addEventListener('click', (e) => {
+                if (e.target.closest && e.target.closest('#eventTabControl .event-tab-header')) {
+                    // Do not re-run the whole layout on a tab switch; just make
+                    // the newly active pane fill the current sidebar width.
+                    suppressUntil = Date.now() + 1200;
+                    setTimeout(syncPaneWidths, 180);
+                    setTimeout(syncPaneWidths, 650);
+                }
+            }, true);
             const attach = () => {
                 parts = findParts();
                 if (!parts) return false;
                 snapshot();
                 startObserver();
+                watchPaneWidths();
                 if (typeof state.ratio === 'number' || !state.camera || !state.slides || state.collapsed) {
                     apply();
                 }
@@ -3831,6 +3992,127 @@
        SIDEBAR BUTTON
        ============================================================ */
 
+    /* ============================================================
+       SCROLL GUARD
+       Panopto auto-follows the playhead in the Contents pane and the
+       thumbnail strip. That fights the user's own scrolling. While the user
+       is interacting with one of those scrollers, block the programmatic
+       writes (scrollTop/scrollLeft/scrollTo/scrollIntoView) for a few seconds.
+       ============================================================ */
+
+    function initScrollGuard() {
+        if (!IS_TOP) return;
+        const manual = new WeakMap();
+        const WINDOW_MS = 6000;
+        const mark = (el) => { if (el) manual.set(el, Date.now() + WINDOW_MS); };
+        const isManual = (el) => (manual.get(el) || 0) > Date.now();
+        const proto = (() => { try { return PAGE_WINDOW.Element.prototype; } catch (e) { return Element.prototype; } })();
+
+        if (proto && !proto.__pdlScrollProtoHooked) {
+            proto.__pdlScrollProtoHooked = true;
+            const wrap = (name) => {
+                const original = proto[name];
+                if (typeof original !== 'function') return;
+                proto[name] = function () {
+                    if (name === 'scrollIntoView') {
+                        let node = this;
+                        while (node) {
+                            if (isManual(node)) return;
+                            node = node.parentElement;
+                        }
+                    } else if (isManual(this)) {
+                        return;
+                    }
+                    return original.apply(this, arguments);
+                };
+            };
+            wrap('scrollIntoView');
+            wrap('scrollTo');
+            wrap('scrollBy');
+        }
+
+        const guarded = new WeakSet();
+        const install = (el) => {
+            if (!el || guarded.has(el)) return;
+            guarded.add(el);
+            if (window.__PDL_HARNESS__) window.__PDL_INSTALL_COUNT__ = (window.__PDL_INSTALL_COUNT__ || 0) + 1;
+
+            // Panopto animates scrollLeft/scrollTop with jQuery (scrollingHighlight),
+            // one write per frame. Reverting after the fact loses that race, so
+            // drop the writes while the user is the one scrolling.
+            const guardProp = (prop) => {
+                let desc = null;
+                try { desc = Object.getOwnPropertyDescriptor(proto, prop); } catch (e) { /* ignore */ }
+                if (!desc || !desc.get || !desc.set) return;
+                try {
+                    Object.defineProperty(el, prop, {
+                        configurable: true,
+                        get() { return desc.get.call(this); },
+                        set(value) {
+                            if (isManual(el)) return;
+                            desc.set.call(this, value);
+                        }
+                    });
+                } catch (e) {
+                    if (window.__PDL_HARNESS__) window.__PDL_GUARD_ERR__ = prop + ': ' + String(e);
+                }
+            };
+            guardProp('scrollLeft');
+            guardProp('scrollTop');
+
+            let userUntil = 0;
+            const userScroll = () => {
+                userUntil = Date.now() + 350;
+                mark(el);
+                if (window.__PDL_HARNESS__) window.__PDL_WHEEL_MARKS__ = (window.__PDL_WHEEL_MARKS__ || 0) + 1;
+            };
+            el.__pdlUserScroll = userScroll;
+            el.addEventListener('wheel', userScroll, { passive: true, capture: true });
+            el.addEventListener('pointerdown', () => { userUntil = Date.now() + 500; mark(el); }, { passive: true, capture: true });
+            el.addEventListener('touchstart', () => { userUntil = Date.now() + 500; mark(el); }, { passive: true, capture: true });
+            el.addEventListener('keydown', () => userScroll(), { passive: true, capture: true });
+        };
+
+        const scan = () => {
+            const thumb = document.getElementById('thumbnailList');
+            if (thumb) install(thumb);
+            document.querySelectorAll('.event-tab-scroll-pane').forEach(install);
+        };
+        scan();
+
+        const markFromEvent = (e) => {
+            if (window.__PDL_HARNESS__) window.__PDL_SCROLL_EVENTS__ = (window.__PDL_SCROLL_EVENTS__ || 0) + 1;
+            const target = e.target && e.target.closest ? e.target.closest('#thumbnailList, .event-tab-scroll-pane') : null;
+            if (target && target.__pdlUserScroll) target.__pdlUserScroll();
+        };
+        document.addEventListener('wheel', markFromEvent, { passive: true, capture: true });
+        document.addEventListener('pointerdown', markFromEvent, { passive: true, capture: true });
+
+        if (window.__PDL_HARNESS__) {
+            window.__PDL_SCROLL_DEBUG__ = () => {
+                const t = document.getElementById('thumbnailList');
+                return {
+                    installed: !!(t && guarded.has(t)),
+                    hasUserScroll: !!(t && typeof t.__pdlUserScroll === 'function'),
+                    installs: window.__PDL_INSTALL_COUNT__ || 0,
+                    events: window.__PDL_SCROLL_EVENTS__ || 0,
+                    marks: window.__PDL_WHEEL_MARKS__ || 0,
+                    desc: !!(t && Object.getOwnPropertyDescriptor(t, 'scrollLeft')),
+                    guardErr: window.__PDL_GUARD_ERR__ || null,
+                    proto: !!proto.__pdlScrollProtoHooked,
+                    manual: t ? isManual(t) : null,
+                    siv: proto.scrollIntoView.toString().slice(0, 90)
+                };
+            };
+        }
+
+        let timer = 0;
+        new MutationObserver(() => {
+            clearTimeout(timer);
+            timer = setTimeout(scan, 400);
+        }).observe(document.body, { childList: true, subtree: true });
+    }
+
     function injectSidebarButton() {
         if (!IS_TOP) return;
         const tabControl = document.getElementById('eventTabControl');
@@ -3893,6 +4175,7 @@
         injectSidebarButton();
 
         UI.init();
+        initScrollGuard();
 
         registerMenu('Open Panopto downloader', () => UI.toggle());
         registerMenu('Toggle dark mode', () => applyDarkMode(!document.body.classList.contains('pdl-dark')));
