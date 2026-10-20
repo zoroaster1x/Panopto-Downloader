@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Panopto Video Downloader
 // @namespace    http://tampermonkey.net/
-// @version      3.3.0
+// @version      3.3.1
 // @description  Download the combined, camera or slides stream (HLS resolved to MP4), resize the viewer, hide a stream, and keep both players in sync.
 // @author       Zoroaster1x
 // @license      GPL-3.0
@@ -535,6 +535,10 @@
             display: none !important;
         }
         body.pdl-dark #rightPane { background: #0f0f14 !important; }
+        body.pdl-dark .secondaryPlayer,
+        body.pdl-dark .secondaryPlayer .secondary-content,
+        body.pdl-dark .secondary-content.slide-deck,
+        body.pdl-dark .slide-deck { background: #0f0f14 !important; }
         body.pdl-dark #rightPlayersContainer { background: #000 !important; }
         body.pdl-dark #thumbnailList { background: #16161d !important; }
         body.pdl-dark .thumbnail {
@@ -1421,7 +1425,7 @@
         /* Splitter */
         #pdl-splitter {
             position: fixed;
-            z-index: 2147483600;
+            z-index: 2147483647;
             display: none;
             width: 14px;
             margin-left: 0;
@@ -1490,8 +1494,8 @@
         #pdl-splitter .pdl-split-collapse {
             position: absolute;
             left: calc(50% + 14px);
-            top: 12px;
-            transform: translate(-50%, 0);
+            top: 50%;
+            transform: translate(-50%, -50%);
             width: 22px;
             height: 22px;
             display: flex;
@@ -1811,17 +1815,26 @@
 
             const secondaryWrapper = rightPlayers.querySelector('.secondaryPlayer');
             const secondaryContent = secondaryWrapper ? secondaryWrapper.querySelector('.secondary-content') : null;
-            // A slides-only / camera-only recording has a single player and no
-            // secondary wrapper. Panopto's native layout already puts it in the
-            // right pane; the two-stream split must not touch it.
-            // The wrapper can exist as an empty placeholder; the video is the
-            // definitive signal for a real second stream.
-            const singleStream = !document.getElementById('secondaryVideo');
+            const secondaryVideo = document.getElementById('secondaryVideo');
+            // Some recordings have the camera in the left pane and a static
+            // slide deck (#slideDeck-image) on the right. There is no
+            // #secondaryVideo, but it is still a two-pane layout; treating it
+            // as one stream moved the camera over the slide deck.
+            const slideDeck = !!(secondaryWrapper && (secondaryWrapper.querySelector('#slideDeck-image, .slide-deck') ||
+                secondaryWrapper.querySelector('img.screen')));
+            const pr = primaryPlayer ? primaryPlayer.getBoundingClientRect() : null;
+            const rr = rightPane ? rightPane.getBoundingClientRect() : null;
+            const primaryInRight = !!(pr && rr && pr.left >= rr.left - 8);
+            // Single-stream means one visual pane: the screen-only layout where
+            // Panopto draws the only player over the right pane. Camera-only and
+            // camera+static-slides keep the camera in the left pane.
+            const singleStream = !secondaryVideo && !slideDeck && primaryInRight;
             return {
                 viewer, leftPane, leftPlayer, primaryPlayer, primaryScreen, aside,
                 eventTabs, eventTabPanes, eventTabControl, searchRegion,
                 main, rightPane, rightPlayers, secondaryScreen, playControls, thumbs,
-                secondaryWrapper, secondaryContent, singleStream,
+                secondaryWrapper, secondaryContent, secondaryVideo, slideDeck,
+                primaryInRight, singleStream,
                 roaming: document.querySelector('.secondaryPlayer.player.roaming')
             };
         }
@@ -1855,6 +1868,9 @@
 
         function aspectOf(screen) {
             if (!screen) return 16 / 9;
+            if (screen.tagName === 'IMG' && screen.naturalWidth > 0 && screen.naturalHeight > 0) {
+                return screen.naturalWidth / screen.naturalHeight;
+            }
             const video = screen.querySelector('video');
             if (video && video.videoWidth && video.videoHeight) {
                 return video.videoWidth / video.videoHeight;
@@ -1864,6 +1880,17 @@
             const a = r.width && r.height ? r.width / r.height : 16 / 9;
             aspectCache.set(screen, a);
             return a;
+        }
+
+        function fitSecondary(w, h) {
+            if (!parts) return;
+            fitScreen(parts.secondaryScreen, w, h);
+            if (parts.slideDeck && parts.secondaryWrapper) {
+                // Static slide decks are images (#slideDeck-image + a buffer).
+                parts.secondaryWrapper.querySelectorAll('#slideDeck-image, .slide-deck img, img.screen').forEach(img => {
+                    fitScreen(img, w, h);
+                });
+            }
         }
 
         function fitScreen(screen, w, h) {
@@ -1903,16 +1930,10 @@
 
         function apply() {
             if (window.__PDL_HARNESS__) window.__PDL_APPLY_COUNT__ = (window.__PDL_APPLY_COUNT__ || 0) + 1;
-            parts = parts || findParts();
+            // The stream shape can change (Panopto creates players late, a
+            // slide deck may replace a video); re-read it on every apply.
+            parts = findParts();
             if (!parts) return false;
-
-            // Panopto may create the second player after the first findParts().
-            // Refresh when the single/multi verdict no longer matches the DOM.
-            const hasSecond = !!document.getElementById('secondaryVideo');
-            if (parts.singleStream === hasSecond) {
-                parts = findParts();
-                if (!parts) return false;
-            }
 
             if (parts.singleStream) {
                 // A slides-only/camera-only recording has one player. Panopto
@@ -2053,7 +2074,7 @@
                     p.secondaryContent.style.height = '100%';
                     p.secondaryContent.style.margin = '0';
                 }
-                fitScreen(p.secondaryScreen, rw, rh);
+                fitSecondary(rw, rh);
             } else {
                 p.leftPane.style.display = '';
                 p.main.style.width = '';
@@ -2132,7 +2153,7 @@
                             p.secondaryContent.style.height = '100%';
                             p.secondaryContent.style.margin = '0';
                         }
-                        fitScreen(p.secondaryScreen, rw, rh);
+                        fitSecondary(rw, rh);
                         if (p.thumbs && isVisible(p.thumbs)) p.thumbs.style.width = rw + 'px';
                     }
                 }
@@ -4439,7 +4460,7 @@
                 clearTimeout(timer);
                 timer = setTimeout(scan, 400);
             }).observe(document.body, { childList: true, subtree: true });
-    
+
     }
 
     function injectPageScrollGuard() {
