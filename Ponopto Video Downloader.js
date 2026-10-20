@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Panopto Video Downloader
 // @namespace    http://tampermonkey.net/
-// @version      3.2.1
+// @version      3.3.0
 // @description  Download the combined, camera or slides stream (HLS resolved to MP4), resize the viewer, hide a stream, and keep both players in sync.
 // @author       Zoroaster1x
 // @license      GPL-3.0
@@ -522,6 +522,18 @@
         }
         body.pdl-dark #dockedCaption { background: #101017 !important; color: #e6e6ec !important; }
         body.pdl-dark #leftPane { background: #16161d !important; }
+        /* Single-stream pages keep #primaryPlayer under #leftPane even though
+           it is drawn over the right pane. Collapsing must not hide the pane
+           (that hides the player): shrink it and hide only its sidebar. */
+        body.pdl-single-collapsed #leftPane {
+            width: 0 !important;
+            max-width: 0 !important;
+            display: table-cell !important;
+            overflow: visible !important;
+        }
+        body.pdl-single-collapsed #leftPane > *:not(#leftPlayerContainer) {
+            display: none !important;
+        }
         body.pdl-dark #rightPane { background: #0f0f14 !important; }
         body.pdl-dark #rightPlayersContainer { background: #000 !important; }
         body.pdl-dark #thumbnailList { background: #16161d !important; }
@@ -1838,7 +1850,7 @@
                 if (style) el.setAttribute('style', style);
                 else el.removeAttribute('style');
             }
-            document.body.classList.remove('pdl-no-camera', 'pdl-no-slides', 'pdl-left-collapsed');
+            document.body.classList.remove('pdl-no-camera', 'pdl-no-slides', 'pdl-left-collapsed', 'pdl-single-collapsed');
         }
 
         function aspectOf(screen) {
@@ -1903,16 +1915,104 @@
             }
 
             if (parts.singleStream) {
-                // One player: resizing it as the camera covers the sidebar with
-                // the player's black background. Keep Panopto's own layout.
-                if (origStyles) restore();
-                parts.viewer.classList.remove('pdl-managed');
-                document.body.classList.remove('pdl-managed', 'pdl-no-camera', 'pdl-no-slides', 'pdl-left-collapsed');
-                if (handle) handle.style.display = 'none';
+                // A slides-only/camera-only recording has one player. Panopto
+                // keeps it under #leftPlayerContainer but positions it
+                // absolutely over the right pane; set left/width/height
+                // explicitly so it stays there when the sidebar moves.
+                const p = parts;
+                if (!origStyles) snapshot();
+                const managed = state.collapsed || typeof state.ratio === 'number';
+                if (!managed) {
+                    // Leave Panopto's native layout alone until the user sets a
+                    // split or collapses. The 1600px inline widths from an
+                    // eager apply pinned the table and broke narrow windows.
+                    if (p.viewer.classList.contains('pdl-managed') ||
+                        document.body.classList.contains('pdl-managed') ||
+                        document.body.classList.contains('pdl-single-collapsed') ||
+                        !!p.primaryPlayer.style.left) {
+                        restore();
+                        p.viewer.classList.remove('pdl-managed');
+                        document.body.classList.remove('pdl-managed', 'pdl-single-collapsed', 'pdl-left-collapsed');
+                    }
+                    scheduleHandle();
+                    return false;
+                }
+                applying = true;
+                const vr = p.viewer.getBoundingClientRect();
+                const W = Math.max(200, Math.round(vr.width));
+                // Use the viewport, not the cached viewer height: on resize
+                // Panopto may not have updated #viewerContent yet.
+                const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+                const H = Math.max(140, Math.round(vh - vr.top));
+                const tabControlW = p.eventTabControl ? Math.round(p.eventTabControl.getBoundingClientRect().width) + 6 : 115;
+                const controlsH = p.playControls ? Math.round(p.playControls.getBoundingClientRect().height) : 46;
+                const thumbsH = (p.thumbs && isVisible(p.thumbs)) ? Math.round(p.thumbs.getBoundingClientRect().height) : 0;
+                const rh = Math.max(100, H - controlsH - thumbsH + 1);
+                p.viewer.classList.toggle('pdl-managed', true);
+                document.body.classList.toggle('pdl-managed', managed);
+                document.body.classList.toggle('pdl-single-collapsed', !!state.collapsed);
+                document.body.classList.remove('pdl-left-collapsed', 'pdl-no-camera', 'pdl-no-slides');
+
+                let targetW = 0;
+                let rw = W;
+                if (state.collapsed) {
+                    // Do not display:none #leftPane: the single player is its
+                    // descendant and would disappear with it.
+                    p.leftPane.style.display = '';
+                    p.leftPane.style.width = '0px';
+                    p.leftPane.style.maxWidth = '0px';
+                    p.leftPane.style.overflow = 'visible';
+                    p.main.style.display = '';
+                    p.main.style.width = '100%';
+                    p.rightPane.style.width = '100%';
+                } else {
+                    p.leftPane.style.display = '';
+                    p.leftPane.style.overflow = '';
+                    p.main.style.display = '';
+                    if (typeof state.ratio === 'number') {
+                        targetW = Math.round(W * state.ratio);
+                    } else {
+                        const current = p.leftPane.getBoundingClientRect().width;
+                        targetW = current > 80 ? Math.round(current) : Math.round(W * 0.29);
+                    }
+                    targetW = clamp(targetW, 220, Math.max(240, W - 260));
+                    rw = Math.max(180, W - targetW);
+                    p.leftPane.style.width = targetW + 'px';
+                    p.leftPane.style.maxWidth = targetW + 'px';
+                    p.main.style.width = rw + 'px';
+                    p.main.style.minWidth = '0';
+                    p.rightPane.style.width = '100%';
+                    p.rightPane.style.minWidth = '0';
+                    if (p.eventTabPanes) {
+                        const panesW = Math.max(60, Math.round((p.leftPane.getBoundingClientRect().width || targetW) - tabControlW));
+                        p.eventTabPanes.style.width = panesW + 'px';
+                        p.eventTabPanes.style.overflow = 'hidden';
+                        p.eventTabPanes.querySelectorAll('.event-tab-pane').forEach(pane => {
+                            pane.style.width = panesW + 'px';
+                        });
+                    }
+                }
+
+                if (!state.collapsed) {
+                    const rr = p.rightPane.getBoundingClientRect();
+                    rw = Math.max(180, Math.round(rr.width));
+                    targetW = Math.max(0, Math.round(rr.left - vr.left));
+                }
+                p.rightPlayers.style.width = rw + 'px';
+                p.rightPlayers.style.height = rh + 'px';
+                p.primaryPlayer.style.left = targetW + 'px';
+                p.primaryPlayer.style.width = rw + 'px';
+                p.primaryPlayer.style.height = rh + 'px';
+                fitScreen(p.primaryScreen, rw, rh);
+                if (p.thumbs && isVisible(p.thumbs)) p.thumbs.style.width = rw + 'px';
+
+                lastGeometry = geometrySnapshot();
+                if (observer) observer.takeRecords();
+                applying = false;
                 scheduleHandle();
-                return false;
+                if (onChange) onChange();
+                return true;
             }
-            if (handle) handle.style.display = '';
 
             if (!origStyles) snapshot();
 
@@ -1925,6 +2025,7 @@
             const searchH = (p.searchRegion && isVisible(p.searchRegion)) ? Math.round(p.searchRegion.getBoundingClientRect().height) : 0;
             const tabControlW = p.eventTabControl ? Math.round(p.eventTabControl.getBoundingClientRect().width) + 6 : 115;
 
+            document.body.classList.remove('pdl-single-collapsed');
             document.body.classList.toggle('pdl-no-camera', !state.camera);
             document.body.classList.toggle('pdl-no-slides', !state.slides);
             document.body.classList.toggle('pdl-left-collapsed', !!state.collapsed);
@@ -2143,13 +2244,18 @@
             if (!handle) return;
             if (!parts) parts = findParts();
             if (!parts) { handle.className = ''; handle.style.display = 'none'; return; }
-            if (parts.singleStream) { handle.className = ''; handle.style.display = 'none'; return; }
 
             if (state.collapsed) {
                 const vr = parts.viewer.getBoundingClientRect();
                 if (vr.width < 80) { handle.style.display = 'none'; return; }
                 handle.className = 'pdl-split-visible pdl-split-collapsed';
                 handle.style.display = 'flex';
+                const showBtn = handle.querySelector('.pdl-split-collapse');
+                if (showBtn) {
+                    showBtn.title = 'Show the sidebar column';
+                    showBtn.setAttribute('aria-label', 'Show the sidebar column');
+                    showBtn.innerHTML = icon('chevronRight', 13);
+                }
                 handle.style.left = Math.round(vr.left) + 'px';
                 handle.style.top = Math.round(vr.top + vr.height / 2 - 22) + 'px';
                 handle.style.height = '44px';
@@ -2170,6 +2276,12 @@
             handle.style.display = 'flex';
             if (sideBySide) {
                 handle.className = 'pdl-split-visible';
+                const hideBtn = handle.querySelector('.pdl-split-collapse');
+                if (hideBtn) {
+                    hideBtn.title = 'Hide the sidebar column';
+                    hideBtn.setAttribute('aria-label', 'Hide the sidebar column');
+                    hideBtn.innerHTML = icon('chevronLeft', 13);
+                }
                 // Sit in the gutter to the right of the boundary. Centring the
                 // 14px handle on the boundary put half of it over the tab text.
                 handle.style.left = Math.round(lr.right - 7) + 'px';
@@ -2270,7 +2382,7 @@
             handle.querySelector('.pdl-split-collapse').addEventListener('click', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                setCollapsed(true);
+                setCollapsed(!state.collapsed);
             });
 
             let drag = null;
@@ -2379,6 +2491,18 @@
         function init() {
             if (!IS_TOP) return;
             buildHandle();
+            // Panopto's Hide leaves the 119px tab strip and its own idea of
+            // the layout; collapse fully instead, and restore with the
+            // splitter chevron or Show.
+            document.addEventListener('click', (e) => {
+                const link = e.target && e.target.closest ? e.target.closest('#eventsExpanderButton') : null;
+                if (!link) return;
+                const label = (link.textContent || '').trim().toLowerCase();
+                if (label !== 'hide' && label !== 'show') return;
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                setCollapsed(label === 'hide');
+            }, true);
             document.addEventListener('click', (e) => {
                 if (e.target.closest && e.target.closest('#eventTabControl .event-tab-header')) {
                     // Do not re-run the whole layout on a tab switch; just make
@@ -2392,7 +2516,6 @@
                 parts = findParts();
                 if (!parts) return false;
                 snapshot();
-                if (handle) handle.style.display = parts.singleStream ? 'none' : '';
                 startObserver();
                 watchPaneWidths();
                 if (!parts.singleStream && (typeof state.ratio === 'number' || !state.camera || !state.slides || state.collapsed)) {
@@ -2532,6 +2655,16 @@
             const podcasts = Array.isArray(d.PodcastStreams) ? d.PodcastStreams : [];
             const raw = Array.isArray(d.Streams) ? d.Streams : [];
 
+            // Panopto can store audio and slides as separate streams. The
+            // archival PodcastStream is then the only file that already has
+            // both, and the per-stream HLS slides is video-only. Say so in the
+            // panel instead of letting "Slides" look like a silent download.
+            const tagText = (s) => String((s && (s.Tag || s.Name || s.StreamType)) || '').toLowerCase();
+            const hasAudioStream = raw.some(s => /audio|voice|sound/.test(tagText(s)));
+            const hasScreenStream = raw.some(s => /screen|slide|visual/.test(tagText(s)) || Number(s && s.StreamType) === 2);
+            const hasCameraStream = raw.some(s => /^(dv|camera|presenter|lecturer)/.test(tagText(s)));
+            const audioScreen = hasAudioStream && hasScreenStream && !hasCameraStream;
+
             podcasts.forEach((s, i) => {
                 const url = resolveUrl(s && (s.StreamUrl || s.StreamHttpUrl));
                 if (!url || seen.has(url)) return;
@@ -2540,11 +2673,15 @@
                 out.push({
                     url,
                     kind: 'combined',
-                    label: podcasts.length > 1 ? 'Combined ' + (i + 1) : 'Combined',
-                    tag: 'Combined',
+                    label: audioScreen
+                        ? (podcasts.length > 1 ? 'Slides + audio ' + (i + 1) : 'Slides + audio')
+                        : (podcasts.length > 1 ? 'Combined ' + (i + 1) : 'Combined'),
+                    tag: audioScreen ? 'Slides + audio' : 'Combined',
                     isHls: hls,
                     ext: hls ? 'm3u8' : 'mp4',
-                    note: 'Camera + slides in one file',
+                    note: audioScreen
+                        ? 'Audio + slides in one file (Panopto mux)'
+                        : 'Camera + slides in one file',
                     size: 0
                 });
             });
@@ -2557,14 +2694,19 @@
                 seen.add(url);
                 const info = classify(s && (s.Tag || s.Name || s.StreamType), s && s.Name, streamIndex++, streamTotal);
                 const hls = String(s && s.ViewerMediaFileTypeName || '').toLowerCase() === 'hls' || /\.m3u8(\?|$)/i.test(url) || /\.panobf\d+/i.test(url);
+                const screenOnly = audioScreen && info.kind === 'screen';
                 out.push({
                     url,
                     kind: info.kind,
-                    label: info.label,
+                    label: screenOnly ? 'Slides (video only)' : info.label,
                     tag: s && (s.Tag || s.Name) || '',
                     isHls: hls,
                     ext: hls ? 'm3u8' : 'mp4',
-                    note: hls ? 'HLS stream, resolved to MP4' : (info.kind === 'screen' ? 'Slides / screen recording' : info.kind === 'camera' ? 'Presenter camera' : 'Direct MP4 file'),
+                    note: hls
+                        ? (screenOnly
+                            ? 'HLS video only — 1080p, no audio. Use Slides + audio for sound.'
+                            : (info.kind === 'audio' ? 'HLS audio only' : 'HLS stream, resolved to MP4'))
+                        : (info.kind === 'screen' ? 'Slides / screen recording' : info.kind === 'camera' ? 'Presenter camera' : 'Direct MP4 file'),
                     size: 0
                 });
             });
@@ -2969,7 +3111,11 @@
 
         function makeFilename(session, stream) {
             const base = sanitizeFilename(session, 'panopto-video');
-            if (stream.kind === 'combined') return sanitizeFilename(base + '.' + stream.ext, 'panopto-video.mp4');
+            // Keep "Combined" short on normal recordings, but label the muxed
+            // audio+slides file so it is not mistaken for the silent 1080p one.
+            if (stream.kind === 'combined' && stream.label === 'Combined') {
+                return sanitizeFilename(base + '.' + stream.ext, 'panopto-video.mp4');
+            }
             return sanitizeFilename(base + ' - ' + stream.label + '.' + stream.ext, 'panopto-video.mp4');
         }
 
@@ -3545,6 +3691,12 @@
                 return;
             }
 
+            if (streams.some(s => s.label === 'Slides + audio') && streams.some(s => s.label === 'Slides (video only)')) {
+                view.appendChild(h('div', { class: 'pdl-faint', style: 'margin:8px 0 10px;font-size:11px;line-height:1.5' }, [
+                    h('strong', { text: 'This recording stores audio and slides separately. ' }),
+                    h('span', { text: 'Download Slides + audio for one file with sound (Panopto mux, 720p); the 1080p Slides file is video-only.' })
+                ]));
+            }
             const list = h('div', { class: 'pdl-stream-list' });
             streams.forEach(stream => list.appendChild(streamCard(stream, title)));
             view.appendChild(list);
@@ -3616,7 +3768,7 @@
         }
 
         function streamCard(stream, title) {
-            const sizeSpan = h('span', { text: stream.size ? formatBytes(stream.size) : (stream.isHls ? 'resolves to MP4' : 'MP4 video') });
+            const sizeSpan = h('span', { text: stream.size ? formatBytes(stream.size) : (stream.isHls ? 'HLS → MP4' : 'MP4 video') });
             sizeSpan.setAttribute('data-size-for', stream.url);
 
             const sub = h('div', { class: 'pdl-stream-sub' }, [
@@ -3908,9 +4060,34 @@
             const single = Layout.isSingleStream();
             if (single) {
                 view.appendChild(h('div', { class: 'pdl-layout-intro', html:
-                    'This recording has a single video stream, so Panopto\'s own layout is kept. ' +
-                    'The divider and the camera/slides toggles are disabled here.'
+                    'This recording has one video stream. Drag the divider or use the slider to resize ' +
+                    'the sidebar; the camera/slides toggles do not apply.'
                 }));
+
+                const singleRatio = Layout.currentRatio();
+                const singleRange = h('input', {
+                    class: 'pdl-range',
+                    type: 'range',
+                    min: '16',
+                    max: '72',
+                    step: '1',
+                    value: String(Math.round(singleRatio * 100)),
+                    'aria-label': 'Sidebar width'
+                });
+                const singleRangeVal = h('span', { class: 'pdl-range-val', text: Math.round(singleRatio * 100) + '%' });
+                singleRange.addEventListener('input', () => {
+                    const v = Number(singleRange.value) / 100;
+                    singleRangeVal.textContent = singleRange.value + '%';
+                    Layout.setRatio(v);
+                });
+                view.appendChild(h('div', { class: 'pdl-row' }, [
+                    h('div', { class: 'pdl-row-label' }, [
+                        h('strong', { text: 'Sidebar width' }),
+                        h('span', { text: 'Tabs vs the video' })
+                    ]),
+                    h('div', { class: 'pdl-split-control', style: 'width:190px' }, [singleRange, singleRangeVal])
+                ]));
+                view.appendChild(toggleRow('Hide sidebar', 'Full-width video; the splitter chevron restores it', state.collapsed, (on) => Layout.setCollapsed(on)));
             } else {
                 view.appendChild(h('div', { class: 'pdl-layout-intro', html:
                     'Drag the divider between the sidebar and the slides. Double-click it to reset. ' +
